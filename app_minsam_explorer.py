@@ -1,0 +1,441 @@
+#!/usr/bin/env python
+"""
+Streamlit app: Commodity MinSam Combination Explorer
+
+Reads the individual-commodity results created by
+MinSam_Engine_V4_Individual_Commodities.py and sums MinSam across the
+commodities selected by the user.
+
+Run:
+    streamlit run app_minsam_explorer.py
+
+Default data file:
+    ./commodity_minsam_result/all_commodities_minsam.parquet
+
+You can also upload a Parquet file through the sidebar.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from io import BytesIO
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
+st.set_page_config(
+    page_title="Commodity MinSam Explorer",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+DEFAULT_CANDIDATES = [
+    Path("commodity_minsam_result/all_commodities_minsam.parquet"),
+    Path("commodity_minsam_result/all_combination_parquet.parquet"),
+    Path("all_commodities_minsam.parquet"),
+    Path("all_combination_parquet.parquet"),
+]
+
+REQUIRED_COLUMNS = {
+    "kelompok_komoditas",
+    "moe",
+    "minsam",
+    "subsektor",
+}
+
+
+@st.cache_data(show_spinner=False)
+def read_parquet_bytes(file_bytes: bytes) -> pd.DataFrame:
+    """Read Parquet bytes and cache the parsed dataframe."""
+    return pd.read_parquet(BytesIO(file_bytes))
+
+
+@st.cache_data(show_spinner=False)
+def read_parquet_path(path_string: str, modified_time: float) -> pd.DataFrame:
+    """Read a local Parquet file; modified_time invalidates the cache."""
+    del modified_time
+    return pd.read_parquet(path_string)
+
+
+def find_default_file() -> Path | None:
+    for candidate in DEFAULT_CANDIDATES:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    missing = REQUIRED_COLUMNS.difference(df.columns)
+    if missing:
+        raise ValueError(
+            "Parquet file is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    data = df.copy()
+    data["kelompok_komoditas"] = (
+        data["kelompok_komoditas"].astype("string").str.strip()
+    )
+    data["subsektor"] = (
+        data["subsektor"].fillna("Unclassified").astype("string").str.strip()
+    )
+    data["moe"] = pd.to_numeric(data["moe"], errors="coerce")
+    data["minsam"] = pd.to_numeric(data["minsam"], errors="coerce")
+
+    data = data.dropna(
+        subset=["kelompok_komoditas", "moe"]
+    )
+    data = data[data["kelompok_komoditas"].ne("")]
+    data["subsektor"] = data["subsektor"].replace("", "Unclassified")
+
+    # The V4 output stores one or more subsector labels separated by "|".
+    # Expand those labels so commodities appear under their subsector group.
+    data["subsektor_group"] = data["subsektor"].str.split(r"\s*\|\s*")
+    data = data.explode("subsektor_group")
+    data["subsektor_group"] = (
+        data["subsektor_group"].fillna("Unclassified").astype(str).str.strip()
+    )
+    data.loc[data["subsektor_group"].eq(""), "subsektor_group"] = "Unclassified"
+
+    # A commodity may have multiple source rows for a given MOE. Keep one
+    # commodity-MOE value only if duplicates agree; otherwise aggregate them
+    # only when they are genuinely duplicate records with identical values.
+    # This app expects the V4 one-row-per-commodity-per-MOE output.
+    duplicated = data.duplicated(
+        subset=["kelompok_komoditas", "moe"], keep=False
+    )
+    if duplicated.any():
+        dup = data.loc[duplicated].sort_values(
+            ["kelompok_komoditas", "moe", "minsam"]
+        )
+        conflicts = (
+            dup.groupby(["kelompok_komoditas", "moe"], dropna=False)["minsam"]
+            .nunique(dropna=False)
+            .gt(1)
+        )
+        if conflicts.any():
+            examples = list(conflicts[conflicts].index[:5])
+            raise ValueError(
+                "Multiple different MinSam values found for the same "
+                "commodity and MOE. Please check the Parquet data. "
+                f"Examples: {examples}"
+            )
+        data = data.drop_duplicates(
+            subset=["kelompok_komoditas", "moe"], keep="first"
+        )
+
+    # Recover one subsector label per commodity for the checklist.
+    commodity_groups = (
+        data.groupby("kelompok_komoditas")["subsektor_group"]
+        .agg(lambda x: " / ".join(sorted(set(x.astype(str)))))
+        .to_dict()
+    )
+    return data, commodity_groups
+
+
+def format_moe(value: float) -> str:
+    return f"{value * 100:g}%"
+
+
+def main():
+    st.title("Commodity MinSam Combination Explorer")
+    st.caption(
+        "Select commodities by subsector. The app sums their individual "
+        "MinSam values for each target MOE."
+    )
+
+    with st.sidebar:
+        st.header("Data source")
+        uploaded = st.file_uploader(
+            "Upload individual-commodity Parquet",
+            type=["parquet"],
+            help=(
+                "Use all_commodities_minsam.parquet generated by the V4 "
+                "individual-commodity engine."
+            ),
+        )
+
+        default_path = find_default_file()
+        if uploaded is not None:
+            try:
+                raw_df = read_parquet_bytes(uploaded.getvalue())
+                source_label = uploaded.name
+            except Exception as exc:
+                st.error(f"Could not read uploaded Parquet: {exc}")
+                st.stop()
+        elif default_path is not None:
+            try:
+                raw_df = read_parquet_path(
+                    str(default_path.resolve()),
+                    default_path.stat().st_mtime,
+                )
+                source_label = str(default_path)
+            except Exception as exc:
+                st.error(f"Could not read {default_path}: {exc}")
+                st.stop()
+        else:
+            st.warning(
+                "No default Parquet file found. Upload "
+                "`all_commodities_minsam.parquet` to continue."
+            )
+            st.stop()
+
+    try:
+        df, commodity_to_subsector = clean_data(raw_df)
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+    commodities = sorted(commodity_to_subsector)
+    if not commodities:
+        st.warning("No commodities were found in the Parquet file.")
+        st.stop()
+
+    st.sidebar.success(f"Loaded {len(commodities)} commodities")
+    st.sidebar.caption(f"Source: {source_label}")
+
+    # Build subsector -> commodity mapping.
+    subsector_to_commodities: dict[str, list[str]] = {}
+    for commodity, subsector_label in commodity_to_subsector.items():
+        for subsector in [x.strip() for x in subsector_label.split("/")]:
+            subsector_to_commodities.setdefault(subsector, []).append(commodity)
+
+    subsector_to_commodities = {
+        subsector: sorted(set(items))
+        for subsector, items in subsector_to_commodities.items()
+    }
+
+    st.subheader("1. Select commodity combination")
+
+    # Use stable widget keys so Select all / Clear selection and subsector
+    # controls update the actual checkbox states on the next rerun.
+    for commodity in commodities:
+        widget_key = f"commodity__{commodity}"
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = (
+                commodity in st.session_state.get("selected_commodities", [])
+            )
+
+    control_cols = st.columns([1, 1, 2])
+    with control_cols[0]:
+        if st.button("Select all", use_container_width=True):
+            for commodity in commodities:
+                st.session_state[f"commodity__{commodity}"] = True
+    with control_cols[1]:
+        if st.button("Clear selection", use_container_width=True):
+            for commodity in commodities:
+                st.session_state[f"commodity__{commodity}"] = False
+    with control_cols[2]:
+        st.caption(
+            "Select individual commodities or use a subsector-level "
+            "button to select/deselect the whole group."
+        )
+
+    subsectors = sorted(subsector_to_commodities)
+    left_col, right_col = st.columns(2)
+
+    for idx, subsector in enumerate(subsectors):
+        target_col = left_col if idx % 2 == 0 else right_col
+        items = subsector_to_commodities[subsector]
+        with target_col:
+            with st.expander(f"{subsector}  ({len(items)} commodities)", expanded=True):
+                group_cols = st.columns(2)
+                with group_cols[0]:
+                    if st.button(
+                        "Select group",
+                        key=f"select_group_{idx}",
+                        use_container_width=True,
+                    ):
+                        for commodity in items:
+                            st.session_state[f"commodity__{commodity}"] = True
+                with group_cols[1]:
+                    if st.button(
+                        "Clear group",
+                        key=f"clear_group_{idx}",
+                        use_container_width=True,
+                    ):
+                        for commodity in items:
+                            st.session_state[f"commodity__{commodity}"] = False
+
+                for commodity in items:
+                    st.checkbox(
+                        commodity,
+                        key=f"commodity__{commodity}",
+                    )
+
+    selected_commodities = [
+        commodity
+        for commodity in commodities
+        if st.session_state.get(f"commodity__{commodity}", False)
+    ]
+    st.session_state["selected_commodities"] = selected_commodities
+
+    st.write(
+        f"**Selected:** {len(selected_commodities)} of {len(commodities)} commodities"
+    )
+    if selected_commodities:
+        st.caption(" · ".join(selected_commodities))
+
+    st.divider()
+    st.subheader("2. MinSam by MOE")
+
+    if not selected_commodities:
+        st.info("Select at least one commodity to display the combined MinSam.")
+        st.stop()
+
+    selected_df = df[
+        df["kelompok_komoditas"].isin(selected_commodities)
+    ].copy()
+
+    # Sum only complete combinations at each MOE. If any selected commodity
+    # has a null MinSam for an MOE, that MOE's total is marked unavailable
+    # rather than silently summing an incomplete subset.
+    expected_n = len(selected_commodities)
+    aggregation = (
+        selected_df.groupby("moe", as_index=False)
+        .agg(
+            total_minsam=("minsam", lambda s: s.sum(min_count=expected_n)),
+            n_commodities_available=("minsam", "count"),
+            n_commodities_rows=("kelompok_komoditas", "nunique"),
+        )
+        .sort_values("moe")
+    )
+    aggregation["is_complete"] = (
+        aggregation["n_commodities_available"].eq(expected_n)
+        & aggregation["n_commodities_rows"].eq(expected_n)
+    )
+    aggregation.loc[~aggregation["is_complete"], "total_minsam"] = pd.NA
+    aggregation["moe_label"] = aggregation["moe"].map(format_moe)
+
+    complete = aggregation.dropna(subset=["total_minsam"]).copy()
+    incomplete = aggregation[aggregation["total_minsam"].isna()].copy()
+
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Selected commodities", f"{expected_n:,}")
+    if not complete.empty:
+        best_precision = complete.loc[complete["moe"].idxmin()]
+        metric_cols[1].metric(
+            "MinSam at strictest available MOE",
+            f"{int(best_precision['total_minsam']):,}",
+        )
+        metric_cols[2].metric(
+            "MOE values available",
+            f"{len(complete):,} / {len(aggregation):,}",
+        )
+    else:
+        metric_cols[1].metric("Combined MinSam", "Unavailable")
+        metric_cols[2].metric("MOE values available", "0")
+
+    if not complete.empty:
+        fig = px.line(
+            complete,
+            x="moe",
+            y="total_minsam",
+            markers=True,
+            custom_data=["moe_label", "n_commodities_available"],
+            title="Combined MinSam by Target MOE",
+            labels={
+                "moe": "Target MOE",
+                "total_minsam": "Sum of MinSam",
+            },
+        )
+        fig.update_traces(
+            hovertemplate=(
+                "MOE: %{customdata[0]}<br>"
+                "Combined MinSam: %{y:,.0f}<br>"
+                "Commodities included: %{customdata[1]}"
+                "<extra></extra>"
+            ),
+            line={"width": 3},
+            marker={"size": 9},
+        )
+        fig.update_layout(
+            height=520,
+            hovermode="x unified",
+            xaxis={
+                "tickmode": "array",
+                "tickvals": complete["moe"].tolist(),
+                "ticktext": complete["moe_label"].tolist(),
+                "title": "Target MOE",
+            },
+            yaxis={
+                "title": "Sum of MinSam",
+                "rangemode": "tozero",
+                "tickformat": ",",
+            },
+            margin={"l": 30, "r": 30, "t": 70, "b": 30},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning(
+            "No complete combined MinSam values are available for this "
+            "selection. Check whether the selected commodities have non-null "
+            "MinSam values at the same MOE."
+        )
+
+    if not incomplete.empty:
+        st.warning(
+            "Some MOE values are omitted from the chart because at least one "
+            "selected commodity has a missing/null MinSam at that MOE. "
+            "The app does not silently treat missing values as zero."
+        )
+
+    with st.expander("View combined result table", expanded=True):
+        display = aggregation[
+            [
+                "moe_label",
+                "total_minsam",
+                "n_commodities_available",
+                "is_complete",
+            ]
+        ].rename(
+            columns={
+                "moe_label": "MOE",
+                "total_minsam": "Combined MinSam",
+                "n_commodities_available": "Commodities with MinSam",
+                "is_complete": "Complete",
+            }
+        )
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Combined MinSam": st.column_config.NumberColumn(
+                    format="%d"
+                ),
+                "Complete": st.column_config.CheckboxColumn(),
+            },
+        )
+
+        csv_bytes = aggregation.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download combined result (CSV)",
+            data=csv_bytes,
+            file_name="combined_commodity_minsam.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("Selected commodity details"):
+        detail = (
+            selected_df[
+                ["kelompok_komoditas", "subsektor", "moe", "minsam"]
+            ]
+            .sort_values(["subsektor", "kelompok_komoditas", "moe"])
+            .rename(
+                columns={
+                    "kelompok_komoditas": "Commodity",
+                    "subsektor": "Subsector",
+                    "moe": "MOE",
+                    "minsam": "Individual MinSam",
+                }
+            )
+        )
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+
+
+if __name__ == "__main__":
+    main()
